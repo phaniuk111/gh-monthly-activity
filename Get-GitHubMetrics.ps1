@@ -149,6 +149,8 @@ function Get-GitProxy {
     catch { return $null }
 }
 
+$script:SsoPartial = $false
+$script:TokenScopes = ''
 $script:ProxyArgs = @{}
 $proxyUrl = $Proxy
 $proxySource = 'the -Proxy parameter'
@@ -184,6 +186,9 @@ function Invoke-GitHub {
     for ($try = 1; ; $try++) {
         try {
             $resp = Invoke-WebRequest -Uri $Url -Headers $script:Headers -UseBasicParsing @script:ProxyArgs
+            # GitHub sets this header when it hides results the login is not SSO-authorised to see
+            if ("$($resp.Headers['X-GitHub-SSO'])" -match 'partial-results') { $script:SsoPartial = $true }
+            if ($resp.Headers['X-OAuth-Scopes']) { $script:TokenScopes = "$($resp.Headers['X-OAuth-Scopes'])" }
             return ($resp.Content | ConvertFrom-Json)
         }
         catch {
@@ -304,6 +309,36 @@ $maxEnd  = ($periodList | Sort-Object EndExclusive | Select-Object -Last 1).EndE
 $me = Invoke-GitHub "$ApiBase/user"
 Write-Host "Using $tokenSource."
 Write-Host "Authenticated as $($me.login). Collecting metrics for '$Handle' in: $($Orgs -join ', ')" -ForegroundColor Cyan
+
+# ---- access check: shows straight away whether this login can see the data ----
+if ($script:TokenScopes) { Write-Host "Login permissions (scopes): $script:TokenScopes" }
+if ($me.login -ne $Handle) {
+    Write-Host "Note: signed in as '$($me.login)', collecting for '$Handle'. Results only include repos '$($me.login)' can see." -ForegroundColor Yellow
+}
+try { $null = Invoke-GitHub "$ApiBase/users/$([uri]::EscapeDataString($Handle))" }
+catch {
+    if ("$_" -match 'HTTP 404') { Write-Warning "GitHub has no user called '$Handle'. Use the exact username from your GitHub profile URL." }
+}
+$accessProblem = $false
+foreach ($org in $Orgs) {
+    try {
+        $rc = (Invoke-GitHub ("$ApiBase/search/repositories?q=" + [uri]::EscapeDataString("org:$org") + '&per_page=1')).total_count
+        Start-Sleep -Milliseconds 2200
+        $pc = (Invoke-GitHub ("$ApiBase/search/issues?q=" + [uri]::EscapeDataString("is:pr author:$Handle org:$org") + '&per_page=1')).total_count
+        Start-Sleep -Milliseconds 2200
+        Write-Host "[$org] $rc repos visible to this login; $pc pull requests by $Handle of all time"
+        if ($rc -eq 0) { $accessProblem = $true }
+    }
+    catch {
+        $accessProblem = $true
+        Write-Warning "[$org] this login cannot search the org (wrong org name, or no access): $(("$_" -split "`n")[0])"
+    }
+}
+if ($accessProblem -or $script:SsoPartial) {
+    Write-Warning ("This login cannot see some or all of the orgs' repos, so counts will be too low or zero.`n" +
+        "Create a classic token with 'repo' and 'read:org' scopes, authorise it for each org with 'Configure SSO',`n" +
+        "then run:  `$env:GITHUB_TOKEN = '<token>'  before the script.")
+}
 
 # Every PR by the handle that could matter to any period: created before the last
 # period ends, and either still open or closed after the first period starts.
