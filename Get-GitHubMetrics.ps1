@@ -9,9 +9,13 @@
                              Default: found with GitHub search, which only sees each
                              repo's default branch and commits whose email is linked
                              to the account. With -AllBranches and/or -Emails the
-                             script instead walks every repo pushed to since the
-                             first period: slower, but sees all branches and can
-                             match commit emails GitHub never linked to the account.
+                             script instead reads the commit lists of the repos the
+                             handle is active in (repos with their pull requests or
+                             default-branch commits): sees all branches and can match
+                             commit emails GitHub never linked to the account.
+                             -Repos org/a,org/b names the repos to read yourself;
+                             -ScanAllRepos reads every repo in the orgs pushed to
+                             since the first period (slow in large orgs).
       Pull Requests (#s)     PRs opened by the handle in the period.
       PR Iterations (Count)  Sum over those PRs of: 1 + number of rework rounds
                              (a reviewer comments / requests changes, then the
@@ -56,6 +60,8 @@ param(
     [string]$Token = $env:GITHUB_TOKEN,
     [switch]$AllBranches,
     [string[]]$Emails = @(),
+    [string[]]$Repos = @(),
+    [switch]$ScanAllRepos,
     [switch]$IncludeArchived,
     [int]$DebtDays = 5,
     [string]$EngineerType = 'Engineer',
@@ -73,8 +79,9 @@ $inv = [Globalization.CultureInfo]::InvariantCulture
 # Allow "a,b" passed as one string (happens with powershell.exe -File)
 $Orgs    = @($Orgs    | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $Periods = @($Periods | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$Emails  = @($Emails  | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
-$deepCommits = $AllBranches -or ($Emails.Count -gt 0)
+$Emails  = @($Emails  | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$Repos   = @($Repos   | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$deepCommits = $AllBranches -or $ScanAllRepos -or ($Emails.Count -gt 0) -or ($Repos.Count -gt 0)
 $Handle  = $Handle.Trim().TrimStart('@')
 $ApiBase = $ApiBase.TrimEnd('/')
 
@@ -325,57 +332,69 @@ foreach ($org in $Orgs) {
 $allPrs = @($prs.Values)
 
 # Commits authored by the handle, keyed by SHA, each tagged with its period.
-$allCommits = @{}
-if (-not $deepCommits) {
-    foreach ($period in $periodList) {
-        foreach ($org in $Orgs) {
-            Write-Host "[$org] finding commits $($period.Label)..."
-            $q = "author:$Handle org:$org author-date:$($period.From)..$($period.To) merge:false"
-            foreach ($c in @(Search-GitHub 'commits' $q)) {
-                if ($allCommits.ContainsKey($c.sha)) { continue }
-                $allCommits[$c.sha] = [pscustomobject]@{
-                    Sha     = $c.sha
-                    Repo    = $c.repository.full_name
-                    Date    = (ConvertTo-Utc $c.commit.author.date)
-                    Message = (($c.commit.message -split "`n")[0])
-                    Url     = $c.html_url
-                    Period  = $period.Label
-                }
+# GitHub search first: quick, but default branches and account-linked emails only.
+$searchCommits = @{}
+foreach ($period in $periodList) {
+    foreach ($org in $Orgs) {
+        Write-Host "[$org] finding commits $($period.Label)..."
+        $q = "author:$Handle org:$org author-date:$($period.From)..$($period.To) merge:false"
+        foreach ($c in @(Search-GitHub 'commits' $q)) {
+            if ($searchCommits.ContainsKey($c.sha)) { continue }
+            $searchCommits[$c.sha] = [pscustomobject]@{
+                Sha     = $c.sha
+                Repo    = $c.repository.full_name
+                Date    = (ConvertTo-Utc $c.commit.author.date)
+                Message = (($c.commit.message -split "`n")[0])
+                Url     = $c.html_url
+                Period  = $period.Label
             }
         }
     }
 }
-else {
+
+$allCommits = $searchCommits
+if ($deepCommits) {
+    $allCommits = @{}
     $firstStart = ($periodList | Sort-Object Start | Select-Object -First 1).Start
     $since = $firstStart.ToString('yyyy-MM-ddTHH:mm:ssZ', $inv)
-    foreach ($org in $Orgs) {
-        $repos = @(Get-GitHubList "$ApiBase/orgs/$org/repos?type=all&sort=pushed&direction=desc" | Where-Object {
-            $pushed = ConvertTo-Utc $_.pushed_at
-            ($IncludeArchived -or -not $_.archived) -and $null -ne $pushed -and $pushed -ge $firstStart
-        })
-        Write-Host "[$org] scanning $($repos.Count) repos pushed to since $($firstStart.ToString('yyyy-MM-dd', $inv)) for commits..."
-        $idx = 0
-        foreach ($repo in $repos) {
-            $idx++
-            $full = $repo.full_name
-            Write-Host "  [$idx/$($repos.Count)] $full"
-            try {
-                $refs = @($repo.default_branch)
-                if ($AllBranches) { $refs = @(Get-GitHubList "$ApiBase/repos/$full/branches" | ForEach-Object { $_.name }) }
-                foreach ($ref in $refs) {
-                    if (-not $ref) { continue }
-                    $url = "$ApiBase/repos/$full/commits?sha=" + [uri]::EscapeDataString($ref) + "&since=$since"
-                    # No extra emails: let GitHub filter by account. Otherwise filter locally.
-                    if ($Emails.Count -eq 0) { $url += '&author=' + [uri]::EscapeDataString($Handle) }
+
+    # Which repos to read commit lists from
+    if ($Repos.Count -gt 0) {
+        $repoNames = @($Repos | ForEach-Object { if ($_ -match '/') { $_ } else { "$($Orgs[0])/$_" } })
+        $why = 'named with -Repos'
+    }
+    elseif ($ScanAllRepos) {
+        $repoNames = @()
+        foreach ($org in $Orgs) {
+            Write-Host "[$org] listing repos..."
+            $repoNames += @(Get-GitHubList "$ApiBase/orgs/$org/repos?type=all&sort=pushed&direction=desc" | Where-Object {
+                $pushed = ConvertTo-Utc $_.pushed_at
+                ($IncludeArchived -or -not $_.archived) -and $null -ne $pushed -and $pushed -ge $firstStart
+            } | ForEach-Object { $_.full_name })
+        }
+        $why = "pushed to since $($firstStart.ToString('yyyy-MM-dd', $inv))"
+    }
+    else {
+        $repoNames = @(@($allPrs | ForEach-Object { $_.Repo }) + @($searchCommits.Values | ForEach-Object { $_.Repo }) | Sort-Object -Unique)
+        $why = "where $Handle has pull requests or default-branch commits"
+    }
+    Write-Host "Reading commit lists of $($repoNames.Count) repos ($why)..." -ForegroundColor Cyan
+
+    $authors = @($Handle) + $Emails
+    $idx = 0
+    foreach ($full in $repoNames) {
+        $idx++
+        try {
+            $refs = @($null)      # $null = the default branch
+            if ($AllBranches) { $refs = @(Get-GitHubList "$ApiBase/repos/$full/branches" | ForEach-Object { $_.name }) }
+            Write-Host "  [$idx/$($repoNames.Count)] $full ($($refs.Count) branch(es))"
+            foreach ($ref in $refs) {
+                foreach ($who in $authors) {
+                    $url = "$ApiBase/repos/$full/commits?since=$since&author=" + [uri]::EscapeDataString($who)
+                    if ($ref) { $url += '&sha=' + [uri]::EscapeDataString($ref) }
                     foreach ($c in @(Get-GitHubList $url)) {
                         if ($allCommits.ContainsKey($c.sha)) { continue }
                         if (@($c.parents).Count -gt 1) { continue }      # merge commit
-                        if ($Emails.Count -gt 0) {
-                            $login = ''
-                            if ($c.author) { $login = $c.author.login }
-                            $mail = "$($c.commit.author.email)".ToLower()
-                            if ($login -ne $Handle -and $Emails -notcontains $mail) { continue }
-                        }
                         $when = ConvertTo-Utc $c.commit.author.date
                         if ($null -eq $when) { continue }
                         $match = $periodList | Where-Object { $when -ge $_.Start -and $when -lt $_.EndExclusive } | Select-Object -First 1
@@ -391,10 +410,10 @@ else {
                     }
                 }
             }
-            catch {
-                # 409 = empty repository, nothing to count
-                if ("$_" -notmatch 'HTTP 409') { Write-Warning "Could not scan ${full}: $_" }
-            }
+        }
+        catch {
+            # 409 = empty repository, nothing to count
+            if ("$_" -notmatch 'HTTP 409') { Write-Warning "Could not read ${full}: $_" }
         }
     }
 }
