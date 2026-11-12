@@ -39,6 +39,10 @@
       1. -Token parameter or $env:GITHUB_TOKEN
       2. the HTTPS login Git already stores for github.com (Git Credential Manager)
       3. a prompt
+    Proxy: looked up in this order: -Proxy, Git's http.proxy setting, Windows proxy
+    settings. The script signs in to the proxy with your Windows login. Use -ProxyCredential (Get-Credential) if the proxy wants a typed
+    username/password, and -Proxy http://host:port to name the proxy yourself.
+
     If you create one yourself: a classic personal access token with the "repo" and
     "read:org" scopes. If your orgs use SAML single sign-on, click "Configure SSO"
     next to the token on github.com and authorise it for BOTH orgs, otherwise
@@ -56,6 +60,8 @@ param(
     [int]$DebtDays = 5,
     [string]$EngineerType = 'Engineer',
     [string]$ApiBase = 'https://api.github.com',
+    [string]$Proxy,
+    [System.Management.Automation.PSCredential]$ProxyCredential,
     [string]$OutDir = '.'
 )
 
@@ -118,18 +124,69 @@ $script:Headers = @{
     'User-Agent'           = 'Get-GitHubMetrics.ps1'
 }
 
+# Company web proxy: find the proxy Windows is configured to use for this address and
+# sign in to it with your Windows login (or -ProxyCredential), as your browser does.
+function Get-GitProxy {
+    param([string]$ForUrl)
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $null }
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        $value = "$(& git config --get-urlmatch http.proxy $ForUrl 2>$null | Select-Object -First 1)".Trim()
+        if (-not $value) { return $null }
+        if ($value -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') { $value = "http://$value" }
+        $u = [uri]$value
+        if (-not $u.Host -or ($u.Scheme -ne 'http' -and $u.Scheme -ne 'https')) { return $null }
+        # drop any "user:password@" part; the script signs in with your Windows login instead
+        return ('{0}://{1}:{2}' -f $u.Scheme, $u.Host, $u.Port)
+    }
+    catch { return $null }
+}
+
+$script:ProxyArgs = @{}
+$proxyUrl = $Proxy
+$proxySource = 'the -Proxy parameter'
+if (-not $proxyUrl) {
+    # the proxy Git itself is configured to use for GitHub (http.proxy in .gitconfig)
+    $gitWebHost = ([uri]$ApiBase).Host -replace '^api\.', ''
+    $proxyUrl = Get-GitProxy "https://$gitWebHost/"
+    $proxySource = "Git's http.proxy setting"
+}
+if (-not $proxyUrl) {
+    $proxySource = 'Windows proxy settings'
+    try {
+        $sysProxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $target = [uri]$ApiBase
+        if (-not $sysProxy.IsBypassed($target)) {
+            $found = $sysProxy.GetProxy($target)
+            if ($found -and $found.Host -ne $target.Host) { $proxyUrl = $found.AbsoluteUri }
+        }
+    }
+    catch { }
+}
+if ($proxyUrl) {
+    $script:ProxyArgs['Proxy'] = $proxyUrl
+    if ($ProxyCredential) { $script:ProxyArgs['ProxyCredential'] = $ProxyCredential }
+    else { $script:ProxyArgs['ProxyUseDefaultCredentials'] = $true }
+    Write-Host "Using web proxy $(([uri]$proxyUrl).Authority) (from $proxySource)"
+}
+
 # ---------------------------------------------------------------- helpers ---
 
 function Invoke-GitHub {
     param([string]$Url)
     for ($try = 1; ; $try++) {
         try {
-            $resp = Invoke-WebRequest -Uri $Url -Headers $script:Headers -UseBasicParsing
+            $resp = Invoke-WebRequest -Uri $Url -Headers $script:Headers -UseBasicParsing @script:ProxyArgs
             return ($resp.Content | ConvertFrom-Json)
         }
         catch {
             $status = 0
             if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            if ($status -eq 407) {
+                throw ("Your company web proxy refused the connection (HTTP 407, proxy authentication required).`n" +
+                    "The request never reached GitHub. Try again with:  -ProxyCredential (Get-Credential)`n" +
+                    "If that also fails, the proxy does not allow scripts to reach $ApiBase and only your IT team can change that.")
+            }
             $detail = "$($_.ErrorDetails.Message) $($_.Exception.Message)"
             $rateLimited = ($status -eq 429) -or ($status -eq 403 -and $detail -match 'rate limit')
             if ($rateLimited -and $try -le 5) {
