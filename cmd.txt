@@ -1,0 +1,1 @@
+  powershell -ExecutionPolicy Bypass -File .\Get-GitHubMetrics.ps1 -Handle your-handle -Orgs "org-one,org-two" -AllBranches -Emails "you@work.com"
